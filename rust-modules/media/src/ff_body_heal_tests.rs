@@ -73,7 +73,14 @@ impl ShortBody {
                 }
                 let mut s = match plx_base::testnet::accept(&srv) {
                     Ok((s, _)) => s,
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    // `Interrupted` is the same poll miss as `WouldBlock`. Returning drops `held`
+                    // and FINs a body the reader is still waiting on.
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                        ) =>
+                    {
                         std::thread::sleep(std::time::Duration::from_millis(2));
                         continue;
                     }
@@ -261,16 +268,27 @@ fn an_unsized_body_is_not_given_the_silence_deadline() {
     let release = srv.release.clone();
     // Well past the silence a sized body would be reopened after.
     let quiet = super::test_support::fixture_body_silence() * 3;
-    let releaser = std::thread::spawn(move || {
-        std::thread::sleep(quiet);
-        release.store(true, Ordering::Release);
+    let (got, end, waited) = with_sized_source(srv.port, -1, |op| {
+        // Receiving the first body byte confirms the connection is open and the body has started.
+        let mut first = 0u8;
+        assert_eq!(read_cb(op, &mut first, 1), 1, "expected the first body byte");
+        let began = std::time::Instant::now();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(quiet);
+            release.store(true, Ordering::Release);
+        });
+        let (rest, end) = read_to_end(op);
+        let waited = began.elapsed();
+        releaser.join().unwrap();
+        let mut got = vec![first];
+        got.extend(rest);
+        (got, end, waited)
     });
-    let began = std::time::Instant::now();
-    let (got, end) = with_sized_source(srv.port, -1, read_to_end);
-    let _ = releaser.join();
-    assert!(began.elapsed() >= quiet, "the read returned before the server spoke again");
-    assert_eq!((got.as_slice(), end), (&b"ABCDEFGH"[..], AVERROR_EOF));
-    assert_eq!(srv.heads().len(), 1, "a transcode that is slow is not a cut: {:?}", srv.heads());
+    let heads = srv.heads();
+    assert!(
+        waited >= quiet && got.as_slice() == b"ABCDEFGH" && end == AVERROR_EOF && heads.len() == 1,
+        "waited {waited:?} got {got:?} end {end} heads {heads:?}"
+    );
 }
 
 /// The reopen of a sized body must come back from the byte asked for. A server that ignores the
